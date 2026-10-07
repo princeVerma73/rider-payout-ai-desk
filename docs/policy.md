@@ -5,3 +5,4 @@
 - ₹10 penalty for every trip the rider cancels. Customer cancellations earn nothing.
 - "Day" means the calendar day in IST.
 - We only look at disputes for the last 7 days.
+ 
