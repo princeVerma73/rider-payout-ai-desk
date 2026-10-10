@@ -1,13 +1,5 @@
-import os
-from sqlalchemy import create_engine, Column, String, Float, Integer, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@postgres:5432/quickdrop")
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+from sqlalchemy import Column, String, Float, Integer, Text
+from app.db.session import Base, engine
 
 class Rider(Base):
     __tablename__ = "riders"
