@@ -1,14 +1,19 @@
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file automatically
+load_dotenv()
+
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.tools import get_rider_details, get_trip_details, check_payout_history
 from app.agent.policy import check_refund_policy
 
-# Initialize Groq LLM
+# Initialize Groq LLM with the latest supported stable model
 llm = ChatGroq(
     api_key=os.environ.get("GROQ_API_KEY"),
-    model_name="llama3-70b-8192", 
+    model_name="llama-3.1-70b-versatile",  # Fixed: Replaced decommissioned model
     temperature=0
 )
 
@@ -20,23 +25,27 @@ tools = [
     check_refund_policy
 ]
 
-# Create the LangGraph ReAct Agent (Reasoning + Acting Loop)
+# Create the LangGraph ReAct Agent
 agent_executor = create_react_agent(
     model=llm, 
-    tools=tools, 
-    state_modifier=SYSTEM_PROMPT
+    tools=tools
 )
 
 def process_dispute_message(rider_id: str, message: str) -> str:
     """
     Takes a rider's message, runs it through the LangGraph agent,
-    and returns the final AI response.
+    and returns the final AI response strictly grounded in data.
     """
-    # Create the input format LangGraph expects
-    inputs = {"messages": [("human", f"[Rider ID: {rider_id}] {message}")]}
+    # Inject the SYSTEM_PROMPT directly as the first message to ensure framework compatibility
+    inputs = {
+        "messages": [
+            ("system", SYSTEM_PROMPT),
+            ("human", f"[Rider ID: {rider_id}] {message}")
+        ]
+    }
     
-    # Run the agent loop (this is where the AI thinks and uses tools)
+    # Run the agent reasoning and tool execution loop
     result = agent_executor.invoke(inputs)
     
-    # The result contains the whole chat history, we return the last AI message
+    # Return the content of the last AI message
     return result["messages"][-1].content

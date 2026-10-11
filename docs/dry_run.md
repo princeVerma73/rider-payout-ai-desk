@@ -1944,3 +1944,185 @@ async def get_ops_pending():
 | `/messages` | `POST` | `MessageRequest` (`rider_id`, `text`, `received_at`) | `{"reply": str}` | Active | Ingests rider disputes & triggers LangGraph agent |
 | `/trace/{rider_id}` | `GET` | `rider_id: str` (path) | `List[dict]` | Stub | Future audit trail & decision history |
 | `/ops/pending` | `GET` | None | `List[dict]` | Stub | Future manual review & manager escalations |
+
+
+---
+
+## Dry Run 7 - Bug Fix: LangGraph Agent Compatibility (core.py)
+
+### Overview & File Changes
+- **Modified File:** `app/agent/core.py`
+- **Purpose:** Resolves a runtime `TypeError` stemming from LangGraph API parameter discrepancies across library versions and ensures seamless local environment variable initialization.
+- **Role in Architecture:** Hardens the core agent initialization so that `uvicorn` and local testing workflows start up cleanly without depending on version-specific keyword parameters (`state_modifier` / `messages_modifier`) or external environment injection flags.
+
+---
+
+### File 1: `app/agent/core.py`
+
+#### Complete Source Code
+
+```python
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file automatically
+load_dotenv()
+
+from langchain_groq import ChatGroq
+from langgraph.prebuilt import create_react_agent
+from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.tools import get_rider_details, get_trip_details, check_payout_history
+from app.agent.policy import check_refund_policy
+
+# Initialize Groq LLM
+llm = ChatGroq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+    model_name="llama3-70b-8192", 
+    temperature=0
+)
+
+# List of all tools our agent can use
+tools = [
+    get_rider_details, 
+    get_trip_details, 
+    check_payout_history, 
+    check_refund_policy
+]
+
+# Create the LangGraph ReAct Agent WITHOUT the modifier keyword (fixes the TypeError)
+agent_executor = create_react_agent(
+    model=llm, 
+    tools=tools
+)
+
+def process_dispute_message(rider_id: str, message: str) -> str:
+    """
+    Takes a rider's message, runs it through the LangGraph agent,
+    and returns the final AI response.
+    """
+    # Inject the SYSTEM_PROMPT directly as the first message to bypass version issues
+    inputs = {
+        "messages": [
+            ("system", SYSTEM_PROMPT),
+            ("human", f"[Rider ID: {rider_id}] {message}")
+        ]
+    }
+    
+    # Run the agent loop
+    result = agent_executor.invoke(inputs)
+    
+    # Return the content of the last AI message
+    return result["messages"][-1].content
+```
+
+---
+
+### Dry Run & Explanation — `app/agent/core.py`
+
+---
+
+#### KYA (What) — What Was Changed and Implemented?
+
+1. **Removed Version-Fragile Keyword Argument from `create_react_agent`:**
+   - In earlier iterations, `create_react_agent` was initialized with `state_modifier=SYSTEM_PROMPT` (or `messages_modifier=SYSTEM_PROMPT`).
+   - Removed this keyword parameter entirely, leaving the constructor call clean and universally compatible: `create_react_agent(model=llm, tools=tools)`.
+2. **Shifted System Prompt Injection to Runtime Invocation:**
+   - Instead of configuring system instructions during graph compilation, the system prompt is now prepended dynamically into the input conversation state as a `("system", SYSTEM_PROMPT)` tuple.
+3. **Automated Local Environment Variable Loading:**
+   - Added `from dotenv import load_dotenv` and invoked `load_dotenv()` at the very top of `core.py` before `ChatGroq` attempts to read `GROQ_API_KEY`.
+
+---
+
+#### KYON (Why) — Why Was This Bug Fix Necessary?
+
+1. **Resolving LangGraph Keyword Divergence (`TypeError: unexpected keyword argument`):**
+   - Between minor versions of `langgraph` (e.g. `0.0.x` vs. `0.1.x` vs. `0.2.x`), the parameter name for passing system instructions to prebuilt ReAct agents underwent multiple breaking changes:
+     - Some releases accept `messages_modifier`
+     - Other releases accept `state_modifier`
+     - Certain local builds or pinned dependencies reject both with a fatal `TypeError: create_react_agent() got an unexpected keyword argument` upon module import.
+   - When `app.main:app` imports `core.py`, any import-level `TypeError` instantly crashes the Uvicorn worker and halts the entire server process.
+
+2. **Preventing Local Missing API Key Errors:**
+   - When developers run `uvicorn app.main:app --reload` locally from a shell where terminal environment variables are not pre-exported, `os.environ.get("GROQ_API_KEY")` returns `None`.
+   - Initializing `ChatGroq(api_key=None)` throws an immediate authentication or validation exception. Invoking `load_dotenv()` inside `core.py` guarantees that `.env` is parsed and populated regardless of how the command was executed.
+
+---
+
+#### KAISE (How) — Technical Breakdown & Execution Logic
+
+##### 1. Explicit Dynamic Message Ingestion:
+```python
+inputs = {
+    "messages": [
+        ("system", SYSTEM_PROMPT),
+        ("human", f"[Rider ID: {rider_id}] {message}")
+    ]
+}
+result = agent_executor.invoke(inputs)
+```
+- **How it solves the version incompatibility:**
+  - LangChain and LangGraph message states accept standard tuple sequences `("system", text)`, `("human", text)`, `("ai", text)`.
+  - By injecting `("system", SYSTEM_PROMPT)` as the first element in the `messages` list, the underlying LLM receives the system prompt as its base instruction in standard chat format across **all** versions of LangGraph, LangChain, and Groq.
+- **Data Flow:**
+  1. The LLM receives the conversation state initialized with `[SystemMessage(SYSTEM_PROMPT), HumanMessage("[Rider ID: ...] ...")]`.
+  2. The LLM parses system constraints (Hinglish persona, max refund limits, policy adherence).
+  3. The ReAct agent calls appropriate tools while maintaining system behavior without needing graph-level state modifiers.
+
+##### 2. Fail-Safe Environment Bootstrapping:
+```python
+from dotenv import load_dotenv
+
+load_dotenv()
+```
+- **How it works:**
+  - Scans the root directory for a `.env` file and loads key-value pairs into `os.environ`.
+  - Runs synchronously before `llm = ChatGroq(...)` runs at module load time.
+  - Ensures `api_key=os.environ.get("GROQ_API_KEY")` receives the actual key whether executed inside Docker, via `uvicorn`, or within standalone test scripts.
+
+---
+
+### Compatibility Comparison Table
+
+| Aspect | Prior Implementation | Bug Fix Implementation (Dry Run 7) |
+|---|---|---|
+| **Compilation Parameter** | `state_modifier=SYSTEM_PROMPT` | Omitted — `create_react_agent(model=llm, tools=tools)` |
+| **System Prompt Delivery** | Bound at graph initialization time | Injected dynamically as `("system", SYSTEM_PROMPT)` per request |
+| **LangGraph Version Support** | Fragile (fails on versions expecting `messages_modifier` or no modifier) | Universal across legacy and modern LangGraph releases |
+| **Local `.env` Handling** | Relied on external CLI flags (`--env-file`) | Auto-loaded programmatically via `load_dotenv()` |
+| **Server Startup Stability** | Crashes on module import if keyword mismatches | Stable, non-breaking startup across all environments |
+
+
+
+## Dry Run 8 - System Audit & Deprecation Fix
+
+### Updated Code (`app/agent/core.py`)
+```python
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+from langchain_groq import ChatGroq
+from langgraph.prebuilt import create_react_agent
+from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.tools import get_rider_details, get_trip_details, check_payout_history
+from app.agent.policy import check_refund_policy
+
+llm = ChatGroq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+    model_name="llama-3.1-70b-versatile",
+    temperature=0
+)
+
+tools = [get_rider_details, get_trip_details, check_payout_history, check_refund_policy]
+
+agent_executor = create_react_agent(model=llm, tools=tools)
+
+def process_dispute_message(rider_id: str, message: str) -> str:
+    inputs = {
+        "messages": [
+            ("system", SYSTEM_PROMPT),
+            ("human", f"[Rider ID: {rider_id}] {message}")
+        ]
+    }
+    result = agent_executor.invoke(inputs)
+    return result["messages"][-1].content
