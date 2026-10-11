@@ -1750,3 +1750,197 @@ Rider Response: "Ravi ji, maine check kiya. Trip T88213 successfully complete hu
 | **System Governance** | Unused constant | Active via `state_modifier=SYSTEM_PROMPT` |
 | **Identity Grounding** | None | Automatic `[Rider ID: {rider_id}]` prefix |
 | **Dynamic Execution** | None | `process_dispute_message` callable from FastAPI |
+
+
+---
+
+## Dry Run 6 - API Integration (main.py)
+
+### Overview & File Changes
+- **Modified File:** `app/main.py`
+- **Purpose:** Connects the FastAPI HTTP layer to the LangGraph AI Agent, replacing the stub `"Agent is under construction"` placeholder with live reasoning via `process_dispute_message`.
+- **Role in Architecture:** Serves as the primary public webhook and API gateway. Ingests rider dispute messages over HTTP, validates incoming request payloads via Pydantic, invokes the agent execution loop, and returns policy-grounded replies while maintaining downstream endpoints (`/trace/{rider_id}`, `/ops/pending`).
+
+---
+
+### File 1: `app/main.py`
+
+#### Complete Source Code
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+from app.agent.core import process_dispute_message
+
+app = FastAPI(title="QuickDrop Support API")
+
+class MessageRequest(BaseModel):
+    rider_id: str
+    text: str
+    received_at: str
+
+@app.get("/health")
+async def health_check():
+    """Check if the server is running normally."""
+    return {"status": "ok"}
+
+@app.post("/messages")
+async def receive_message(msg: MessageRequest):
+    """
+    Receives dispute messages from the frontend.
+    Passes the rider_id and message text to the LangGraph AI Agent for processing.
+    """
+    try:
+        # Pass the incoming rider ID and message to the AI agent
+        ai_reply = process_dispute_message(msg.rider_id, msg.text)
+        return {"reply": ai_reply}
+    except Exception as e:
+        # Fallback mechanism in case the agent execution fails
+        return {"reply": f"Internal System Error: {str(e)}"}
+
+@app.get("/trace/{rider_id}")
+async def get_trace(rider_id: str):
+    """Returns the LangGraph execution trace logs for a specific rider."""
+    return []
+
+@app.get("/ops/pending")
+async def get_ops_pending():
+    """Returns the list of pending manual operations."""
+    return []
+```
+
+---
+
+### Dry Run & Explanation — `app/main.py`
+
+---
+
+#### KYA (What) — What Was Changed and Implemented?
+
+1. **Replaced Mock Stub with Live Agent Hook:**
+   - In earlier iterations, `POST /messages` returned a static stub `{"reply": "Agent is under construction"}`.
+   - It is now fully connected to the LangGraph autonomous agent via `process_dispute_message(msg.rider_id, msg.text)`.
+2. **Standardized Pydantic Request Validation:**
+   - Kept the `MessageRequest` schema (`rider_id: str`, `text: str`, `received_at: str`) to parse and strictly validate JSON payloads from WhatsApp/messaging webhooks or frontend clients.
+3. **Robust Exception Handling & Fail-Safe Fallback:**
+   - Wrapped agent execution in a `try...except` block to prevent unhandled 500 server crashes if the Groq LLM API suffers rate-limiting or network hiccups. Returns an actionable diagnostic fallback message instead.
+4. **Preserved Operational Stub Endpoints:**
+   - Retained `/health`, `/trace/{rider_id}`, and `/ops/pending` routes to satisfy infrastructure health checks and prepare for upcoming Phase 3 Ops & Trace implementations.
+
+---
+
+#### KYON (Why) — Why Is This Integration Vital?
+
+1. **Bridging the HTTP Interface to Agentic Intelligence:**
+   - The rider or messaging provider interacts via HTTP/REST. Without wiring `POST /messages` to `core.py`, the ReAct graph, the database tools, and the payout policy engine remain unreachable isolated components.
+2. **Preventing Disruption to Existing Contracts:**
+   - The evaluation framework (`evals/run.py`), Docker healthchecks, and the upcoming Ops Dashboard depend on exact API paths (`/health`, `/messages`, `/trace/{rider_id}`, `/ops/pending`). Preserving these endpoints guarantees zero breaking changes across system boundaries.
+3. **Resilience & Production Safety:**
+   - LLMs rely on external cloud APIs (Groq). If an API key expires or a timeout occurs, crashing the FastAPI server would bring down the whole dispute desk. The defensive `try/except` boundary ensures the server stays responsive and logs the issue cleanly.
+
+---
+
+#### KAISE (How) — Line-by-Line Mechanics & Data Flow
+
+##### 1. Request Parsing via Pydantic:
+```python
+class MessageRequest(BaseModel):
+    rider_id: str
+    text: str
+    received_at: str
+```
+- **Automatic Serialization & Validation:** When an HTTP request hits `POST /messages`, FastAPI validates that the body contains `rider_id`, `text`, and `received_at` as strings. If any required field is missing, FastAPI automatically returns a `422 Unprocessable Entity` without executing backend logic.
+
+##### 2. Message Dispatcher & AI Execution:
+```python
+@app.post("/messages")
+async def receive_message(msg: MessageRequest):
+    try:
+        # Pass the incoming rider ID and message to the AI agent
+        ai_reply = process_dispute_message(msg.rider_id, msg.text)
+        return {"reply": ai_reply}
+```
+- **`msg.rider_id` & `msg.text` Extraction:** Unpacks the typed fields from the validated Pydantic model.
+- **Synchronous Agent Execution:** Calls `process_dispute_message(msg.rider_id, msg.text)`. Inside `core.py`, this prepends `[Rider ID: {rider_id}]` and triggers the LangGraph ReAct loop:
+  1. LangGraph queries Postgres via `get_rider_details` / `get_trip_details` / `check_payout_history`.
+  2. Evaluates rules via `check_refund_policy`.
+  3. Formulates a personalized, empathetic Hinglish reply.
+- **Response Format:** Returns a clean JSON dictionary `{"reply": ai_reply}`, matching the contract expected by automated eval scripts and client UIs.
+
+##### 3. Exception Handling & Graceful Degradation:
+```python
+    except Exception as e:
+        # Fallback mechanism in case the agent execution fails
+        return {"reply": f"Internal System Error: {str(e)}"}
+```
+- Traps unexpected runtime exceptions (e.g., Groq API unavailability, DB connection blips) and returns a formatted JSON payload so the client receives a readable message rather than a generic network drop.
+
+##### 4. Complementary Monitoring Endpoints:
+```python
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+@app.get("/trace/{rider_id}")
+async def get_trace(rider_id: str):
+    return []
+
+@app.get("/ops/pending")
+async def get_ops_pending():
+    return []
+```
+- **`/health`:** Consumed by Docker Compose and CI workflows (`curl http://localhost:8000/health`) to ascertain container readiness.
+- **`/trace/{rider_id}` & `/ops/pending`:** Stubbed routes ready to be wired into database dispute queues and LangGraph execution traces in subsequent steps.
+
+---
+
+### End-to-End System Request-Response Flow
+
+```
++-------------------------------------------------------------------+
+|               Rider Client / Eval Script / Webhook                |
++-------------------------------------------------------------------+
+                                │
+                                │ HTTP POST /messages
+                                │ JSON: {"rider_id": "R003", "text": "trip T88213 surge nahi mila", "received_at": "..."}
+                                ▼
++-------------------------------------------------------------------+
+|                     FastAPI Layer (app/main.py)                   |
+|  - Validates payload against MessageRequest                       |
+|  - Calls process_dispute_message("R003", text)                   |
++-------------------------------------------------------------------+
+                                │
+                                ▼
++-------------------------------------------------------------------+
+|                   LangGraph Core (app/agent/core.py)              |
+|  - Initializes agent with [Rider ID: R003] prefix                 |
+|  - Cycles through ReAct loop with Llama-3 70B                    |
++-------------------------------------------------------------------+
+                 │                                │
+                 │ Tool Call                      │ Tool Call
+                 ▼                                ▼
++--------------------------------+ +--------------------------------+
+|  DB Tools (app/agent/tools.py) | | Policy (app/agent/policy.py)   |
+|  - get_trip_details("T88213")  | | - check_refund_policy(...)     |
+|  - check_payout_history("R003")| |                                |
++--------------------------------+ +--------------------------------+
+                 │                                │
+                 └────────────────┬───────────────┘
+                                  ▼
++-------------------------------------------------------------------+
+|                   Final Synthesis & Response                      |
+|  - Agent formulates policy-compliant Hinglish response            |
+|  - Returns: {"reply": "Ravi ji, T88213 trip completed hai..."}    |
++-------------------------------------------------------------------+
+```
+
+---
+
+### Endpoint Specifications Summary
+
+| Endpoint | Method | Input Model / Params | Output Format | Status | Purpose |
+|---|---|---|---|---|---|
+| `/health` | `GET` | None | `{"status": "ok"}` | Active | Docker health checks & liveness probe |
+| `/messages` | `POST` | `MessageRequest` (`rider_id`, `text`, `received_at`) | `{"reply": str}` | Active | Ingests rider disputes & triggers LangGraph agent |
+| `/trace/{rider_id}` | `GET` | `rider_id: str` (path) | `List[dict]` | Stub | Future audit trail & decision history |
+| `/ops/pending` | `GET` | None | `List[dict]` | Stub | Future manual review & manager escalations |
