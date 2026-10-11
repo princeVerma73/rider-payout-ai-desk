@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 import os
+import time
 import logging
 
 from langchain_groq import ChatGroq
@@ -23,8 +24,8 @@ from app.db.models import ConversationMessage
 logger = logging.getLogger(__name__)
 
 # Initialize Groq LLM with fallback chain across available models
-primary_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-candidate_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+primary_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+candidate_models = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
 model_order = [primary_model] + [m for m in candidate_models if m != primary_model]
 
 primary_llm = ChatGroq(
@@ -102,21 +103,29 @@ def process_dispute_message(rider_id: str, message: str, message_id: str = None,
     
     inputs = {"messages": messages}
 
-    try:
-        # 3. Execute agent loop
-        result = agent_executor.invoke(inputs)
-        reply_content = result["messages"][-1].content
-    except Exception as e:
-        logger.error(f"Error during agent execution: {e}", exc_info=True)
-        record_trace(
-            rider_id=rider_id,
-            step_type="error",
-            name="agent_execution_failure",
-            input_data={"message": message},
-            output_data=str(e)
-        )
-        print(f"ACTUAL CRASH REASON: {str(e)}")
-        reply_content = "Bhai, humare system mein thodi takneeki samasya aayi hai. Kripya thodi der baad dobara message karein."
+    reply_content = None
+    for attempt in range(3):
+        try:
+            # 3. Execute agent loop
+            result = agent_executor.invoke(inputs)
+            reply_content = result["messages"][-1].content
+            break
+        except Exception as e:
+            err_msg = str(e)
+            print(f"ACTUAL CRASH REASON (attempt {attempt+1}/3): {err_msg}")
+            if ("429" in err_msg or "rate_limit" in err_msg.lower() or "too large" in err_msg.lower()) and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            logger.error(f"Error during agent execution: {e}", exc_info=True)
+            record_trace(
+                rider_id=rider_id,
+                step_type="error",
+                name="agent_execution_failure",
+                input_data={"message": message},
+                output_data=err_msg
+            )
+            reply_content = "Bhai, humare system mein thodi takneeki samasya aayi hai. Kripya thodi der baad dobara message karein."
+            break
 
     # 4. Record agent reply in trace log
     record_trace(

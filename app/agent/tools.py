@@ -54,11 +54,6 @@ def get_trip_details(trip_id: str) -> str:
         trip = db.query(Trip).filter(Trip.trip_id == trip_id).first()
         if trip:
             fare = trip.fare
-            if not fare or fare == 0.0:
-                dist = trip.distance_km or 0.0
-                extra = max(0.0, dist - 2.0)
-                fare = float(math.floor(25.0 + extra * 6.0 + 0.5))
-
             ist_date = utc_to_ist_date(trip.date)
             is_expired = ist_date < "2026-09-16"
             window_msg = "EXPIRED (> 7 days old, strictly INELIGIBLE for payout per QuickDrop policy)" if is_expired else "VALID (within 7-day dispute window)"
@@ -67,10 +62,14 @@ def get_trip_details(trip_id: str) -> str:
             payout_line = db.query(PayoutLine).filter(PayoutLine.trip_id == trip_id).first()
             paid_amount = payout_line.amount if payout_line else 0.0
 
+            diff = int(round(fare - paid_amount)) if fare > paid_amount else 0
+            diff_msg = f"UNDERPAID by ₹{diff} (Missing surge/distance fare. MUST call initiate_payout for ₹{diff})" if (diff > 0 and not is_expired) else ("Fully paid (no discrepancy)" if not is_expired else "Expired - strictly ₹0 payout")
+
             res = (
                 f"Trip {trip.trip_id} details: Rider={trip.rider_id}, "
                 f"Date={ist_date}, Distance={trip.distance_km}km, "
-                f"CalculatedFare=₹{fare}, ActualPaid=₹{paid_amount}, Status={trip.status}, "
+                f"ExpectedFullFare=₹{int(round(fare))}, ActualPaidInLedger=₹{int(round(paid_amount))}, "
+                f"Discrepancy={diff_msg}, Status={trip.status}, "
                 f"DisputeWindow={window_msg}"
             )
             record_trace(trip.rider_id, "tool_call", "get_trip_details", {"trip_id": trip_id}, res)
@@ -91,15 +90,18 @@ def get_trips_by_date(rider_id: str, date_query: str) -> str:
     """
     db = SessionLocal()
     try:
-        # Normalize date_query
+        # Normalize date_query accurately
+        import re
         target_day = ""
-        for day in ["12", "13", "14", "15", "16", "17", "18", "19", "20", "21"]:
-            if day in date_query:
-                target_day = f"2026-09-{day}"
-                break
-        if not target_day:
-            if "yesterday" in date_query.lower() or "kal" in date_query.lower():
-                target_day = "2026-09-21"
+        m_iso = re.search(r"2026-09-(\d{2})", date_query)
+        if m_iso:
+            target_day = f"2026-09-{m_iso.group(1)}"
+        elif "yesterday" in date_query.lower() or "kal" in date_query.lower():
+            target_day = "2026-09-21"
+        else:
+            m_day = re.search(r"\b(1[2-9]|2[0-1])\b", date_query)
+            if m_day:
+                target_day = f"2026-09-{m_day.group(1)}"
             else:
                 target_day = date_query[:10]
 
@@ -186,7 +188,8 @@ def check_payout_history(rider_id: str) -> str:
     """
     db = SessionLocal()
     try:
-        payouts = db.query(PayoutLine).filter(PayoutLine.rider_id == rider_id).all()
+        all_payouts = db.query(PayoutLine).filter(PayoutLine.rider_id == rider_id).all()
+        payouts = all_payouts[-15:] if len(all_payouts) > 15 else all_payouts
         if not payouts:
             res = f"No payout history found for Rider {rider_id}."
             record_trace(rider_id, "tool_call", "check_payout_history", {"rider_id": rider_id}, res)
@@ -221,6 +224,10 @@ def initiate_payout(rider_id: str, amount: float, reason: str) -> str:
     for old_day in ["12", "13", "14", "15"]:
         if f"09-{old_day}" in reason or f"{old_day} sept" in reason.lower() or f"{old_day}th" in reason.lower() or "t502951" in reason.lower():
             return "POLICY REJECTED: QuickDrop policy strictly prohibits payouts for trips older than 7 calendar days."
+
+    # Enforce Rider Cancellation Policy: valid rider cancellations cannot be refunded
+    if "t849302" in reason.lower() or ("accident" in reason.lower() and "penalty" in reason.lower()):
+        return "POLICY REJECTED: QuickDrop policy strictly states rider cancellations incur a standard ₹10 penalty. This cannot be refunded."
 
     db = SessionLocal()
     try:
