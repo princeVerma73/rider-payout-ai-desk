@@ -42,10 +42,13 @@ def seed_database():
             if dist > 100.0:
                 dist = dist / 1000.0
             surge = float(row.get("surge_multiplier", 1.0))
-            # Calculate standard fare if not explicitly in CSV
-            extra = max(0.0, dist - 2.0)
-            calc_fare = float(math.floor((25.0 + extra * 6.0) * surge + 0.5))
-            fare = float(row.get("fare", calc_fare))
+            status = str(row.get("status", ""))
+            if status == "completed":
+                extra = max(0.0, dist - 2.0)
+                calc_fare = float(math.floor((25.0 + extra * 6.0) * surge + 0.5))
+            else:
+                calc_fare = 0.0
+            fare = float(row.get("fare", calc_fare)) if status == "completed" else 0.0
             date_val = str(row.get("date") or row.get("started_at", ""))
             db.merge(Trip(
                 trip_id=str(row.get("trip_id")),
@@ -53,7 +56,7 @@ def seed_database():
                 date=date_val,
                 distance_km=dist,
                 fare=fare,
-                status=str(row.get("status", ""))
+                status=status
             ))
 
     # 3. Seed Payout Lines

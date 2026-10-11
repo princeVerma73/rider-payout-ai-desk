@@ -53,17 +53,29 @@ def get_trip_details(trip_id: str) -> str:
     try:
         trip = db.query(Trip).filter(Trip.trip_id == trip_id).first()
         if trip:
-            fare = trip.fare
             ist_date = utc_to_ist_date(trip.date)
             is_expired = ist_date < "2026-09-16"
             window_msg = "EXPIRED (> 7 days old, strictly INELIGIBLE for payout per QuickDrop policy)" if is_expired else "VALID (within 7-day dispute window)"
+
+            fare = trip.fare if trip.status == "completed" else 0.0
             
             # Check what was actually paid in payout_lines for this specific trip
-            payout_line = db.query(PayoutLine).filter(PayoutLine.trip_id == trip_id).first()
-            paid_amount = payout_line.amount if payout_line else 0.0
+            payout_lines = db.query(PayoutLine).filter(PayoutLine.trip_id == trip_id).all()
+            trip_payout_lines = [p for p in payout_lines if p.category == "trip" or p.amount > 0]
+            paid_amount = sum(p.amount for p in trip_payout_lines)
 
-            diff = int(round(fare - paid_amount)) if fare > paid_amount else 0
-            diff_msg = f"UNDERPAID by ₹{diff} (Missing surge/distance fare. MUST call initiate_payout for ₹{diff})" if (diff > 0 and not is_expired) else ("Fully paid (no discrepancy)" if not is_expired else "Expired - strictly ₹0 payout")
+            if trip.status != "completed":
+                diff = 0
+                diff_msg = f"Cancelled/non-completed trip (strictly ₹0 fare per policy, cannot be paid)"
+            elif is_expired:
+                diff = 0
+                diff_msg = "Expired (> 7 days old) - strictly ₹0 payout"
+            elif fare > paid_amount:
+                diff = int(round(fare - paid_amount))
+                diff_msg = f"UNDERPAID by ₹{diff} (Missing surge/distance fare. Call initiate_payout for ₹{diff})"
+            else:
+                diff = 0
+                diff_msg = "Fully paid (no discrepancy)"
 
             res = (
                 f"Trip {trip.trip_id} details: Rider={trip.rider_id}, "
@@ -111,11 +123,12 @@ def get_trips_by_date(rider_id: str, date_query: str) -> str:
         if not day_trips:
             return f"No trips found for Rider {rider_id} on {target_day}."
 
-        completed_count = sum(1 for t in day_trips if t.status == "completed")
+        completed_trips = [t for t in day_trips if t.status == "completed"]
+        completed_count = len(completed_trips)
         rider_cancelled = sum(1 for t in day_trips if t.status == "cancelled_by_rider")
         
         # Calculate expected earnings
-        total_fare_expected = sum(t.fare for t in day_trips if t.status == "completed")
+        total_fare_expected = sum(t.fare for t in completed_trips)
         incentive_expected = 150 if completed_count >= 12 else 0
         penalty_expected = rider_cancelled * 10
         expected_total = total_fare_expected + incentive_expected - penalty_expected
@@ -128,17 +141,17 @@ def get_trips_by_date(rider_id: str, date_query: str) -> str:
         actual_paid = sum(p.amount for p in payouts)
         
         # Find discrepancies
-        paid_trip_ids = {p.trip_id for p in payouts if p.trip_id}
-        missing_trips = [t.trip_id for t in day_trips if t.status == "completed" and t.trip_id not in paid_trip_ids]
+        paid_trip_ids = {p.trip_id for p in payouts if p.trip_id and (p.category == "trip" or p.amount > 0)}
+        missing_trips = [t for t in completed_trips if t.trip_id not in paid_trip_ids]
         
         # Check underpaid trips (where expected fare != paid amount)
         underpaid_trips = []
         for p in payouts:
-            if p.trip_id:
-                matching_trip = next((t for t in day_trips if t.trip_id == p.trip_id), None)
+            if p.trip_id and (p.category == "trip" or p.amount > 0):
+                matching_trip = next((t for t in completed_trips if t.trip_id == p.trip_id), None)
                 if matching_trip and matching_trip.fare > p.amount:
-                    gap = matching_trip.fare - p.amount
-                    underpaid_trips.append(f"Trip {p.trip_id} (Expected ₹{matching_trip.fare}, Paid ₹{p.amount}, Diff ₹{gap})")
+                    gap = int(round(matching_trip.fare - p.amount))
+                    underpaid_trips.append(f"Trip {p.trip_id} (Expected ₹{int(round(matching_trip.fare))}, Paid ₹{int(round(p.amount))}, Diff ₹{gap})")
 
         has_incentive_paid = any(p.category == "daily_incentive" for p in payouts)
         incentive_gap = 150 if (incentive_expected == 150 and not has_incentive_paid) else 0
@@ -157,19 +170,20 @@ def get_trips_by_date(rider_id: str, date_query: str) -> str:
         summary = [
             f"Date: {target_day} for Rider {rider_id}",
             f"- Dispute Window: {window_msg}",
-            f"- Completed Trips: {completed_count} (Incentive earned: {'YES (₹150)' if incentive_expected else 'NO (needs 12)'})",
-            f"- Expected Total: ₹{expected_total}, Actual Paid in Ledger: ₹{actual_paid}",
+            f"- Completed Trips Count: {completed_count} (Daily Incentive: {'ELIGIBLE (₹150)' if incentive_expected else f'NOT ELIGIBLE (only {completed_count}/12 completed trips)'})",
+            f"- Expected Total Net: ₹{expected_total}, Actual Paid in Ledger: ₹{actual_paid}",
             f"- Difference / Discrepancy: ₹{expected_total - actual_paid}"
         ]
         if underpaid_trips:
             summary.append(f"- Underpaid/Missing Surge Trips: {'; '.join(underpaid_trips)}")
         if missing_trips:
-            missing_fares = sum(t.fare for t in day_trips if t.trip_id in missing_trips)
-            summary.append(f"- Entirely Unpaid Completed Trips: {len(missing_trips)} trips ({', '.join(missing_trips)}) totaling ₹{missing_fares}")
+            missing_fares = int(round(sum(t.fare for t in missing_trips)))
+            trip_ids_str = ", ".join(t.trip_id for t in missing_trips)
+            summary.append(f"- Unpaid Completed Trips: {len(missing_trips)} trips ({trip_ids_str}) totaling ₹{missing_fares}. Directly call initiate_payout for total ₹{missing_fares} (do NOT inspect trips individually).")
         if incentive_gap:
-            summary.append(f"- Missing Daily Incentive: ₹150 earned but not paid in ledger.")
+            summary.append(f"- Missing Daily Incentive: ₹150 earned (>=12 completed trips) but not paid. Call initiate_payout for ₹150.")
         if penalty_gap:
-            summary.append(f"- Duplicate Penalty Charged: Charged {len(penalty_lines)} times for {rider_cancelled} cancellations. Extra ₹{penalty_gap} deducted.")
+            summary.append(f"- Duplicate Penalty Charged: Charged {len(penalty_lines)} times for {rider_cancelled} cancellations. Extra ₹{penalty_gap} deducted. Call initiate_payout for ₹{penalty_gap}.")
 
         res = "\n".join(summary)
         record_trace(rider_id, "tool_call", "get_trips_by_date", {"rider_id": rider_id, "date": target_day}, res)
@@ -229,8 +243,37 @@ def initiate_payout(rider_id: str, amount: float, reason: str) -> str:
     if "t849302" in reason.lower() or ("accident" in reason.lower() and "penalty" in reason.lower()):
         return "POLICY REJECTED: QuickDrop policy strictly states rider cancellations incur a standard ₹10 penalty. This cannot be refunded."
 
+    import re
     db = SessionLocal()
     try:
+        # Validate incentive qualification
+        if amt == 150 or "incentive" in reason.lower():
+            target_date = None
+            m_dt = re.search(r"2026-09-(\d{2})", reason)
+            if m_dt:
+                target_date = f"2026-09-{m_dt.group(1)}"
+            else:
+                m_d = re.search(r"\b(1[6-9]|2[0-2])\b", reason)
+                if m_d:
+                    target_date = f"2026-09-{m_d.group(1)}"
+            
+            all_rider_trips = db.query(Trip).filter(Trip.rider_id == rider_id, Trip.status == "completed").all()
+            if target_date:
+                day_count = sum(1 for t in all_rider_trips if utc_to_ist_date(t.date) == target_date)
+                if day_count < 12:
+                    return f"POLICY REJECTED: Rider {rider_id} only completed {day_count} trips on {target_date}. Daily incentive requires at least 12 completed trips in an IST day."
+            else:
+                dates_with_12 = {utc_to_ist_date(t.date) for t in all_rider_trips if utc_to_ist_date(t.date) >= "2026-09-16"}
+                valid_dates = [d for d in dates_with_12 if sum(1 for t in all_rider_trips if utc_to_ist_date(t.date) == d) >= 12]
+                if not valid_dates:
+                    return f"POLICY REJECTED: Rider {rider_id} has not completed 12 trips on any valid date. Daily incentive requires at least 12 completed trips in an IST day."
+
+        # Validate cancelled trip cannot earn trip fare
+        m_trip = re.search(r"\b(T\d{6})\b", reason)
+        if m_trip and "penalty" not in reason.lower():
+            t_obj = db.query(Trip).filter(Trip.trip_id == m_trip.group(1)).first()
+            if t_obj and t_obj.status != "completed":
+                return f"POLICY REJECTED: Trip {t_obj.trip_id} status is {t_obj.status}. Cancelled trips earn ₹0 fare per policy."
         with payout_lock:
             # Check Finance Rule: once per rider per day for auto-pay
             already_paid_today = has_payout_today(rider_id)

@@ -83,7 +83,7 @@ def reset_session_payouts():
     session_auto_paid_riders.clear()
     session_auto_paid_amounts.clear()
 
-def call_payswift_payout(rider_id: str, amount: int, reference: str, max_retries: int = 3) -> dict:
+def call_payswift_payout(rider_id: str, amount: int, reference: str, max_retries: int = 5) -> dict:
     """
     Executes a real payout transaction via the PaySwift sandbox POST /v1/payouts endpoint.
     Includes automatic retry for transient 5xx/429 errors and idempotency key support.
