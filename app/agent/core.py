@@ -1,51 +1,130 @@
-import os
 from dotenv import load_dotenv
+load_dotenv(override=True)
 
-# Load environment variables from .env file automatically
-load_dotenv()
+import os
+import logging
 
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from app.agent.prompts import SYSTEM_PROMPT
-from app.agent.tools import get_rider_details, get_trip_details, check_payout_history
-from app.agent.policy import check_refund_policy
-
-# Initialize Groq LLM with an active and accessible model
-llm = ChatGroq(
-    api_key=os.environ.get("GROQ_API_KEY"),
-    model_name=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
-    temperature=0
+from app.agent.tools import (
+    get_rider_details,
+    get_trip_details,
+    get_trips_by_date,
+    check_payout_history,
+    initiate_payout,
+    escalate_to_ops
 )
+from app.agent.policy import check_refund_policy
+from app.agent.services import record_trace
+from app.db.session import SessionLocal
+from app.db.models import ConversationMessage
 
-# List of all tools our agent can use
+logger = logging.getLogger(__name__)
+
+# Initialize Groq LLM with fallback chain across available models
+primary_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+candidate_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+model_order = [primary_model] + [m for m in candidate_models if m != primary_model]
+
+primary_llm = ChatGroq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+    model_name=model_order[0],
+    temperature=0,
+    max_retries=1
+)
+fallback_llms = [
+    ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), model_name=m, temperature=0, max_retries=1)
+    for m in model_order[1:]
+]
+llm = primary_llm.with_fallbacks(fallback_llms)
+
+# Full tool suite for the autonomous dispute agent
 tools = [
-    get_rider_details, 
-    get_trip_details, 
-    check_payout_history, 
-    check_refund_policy
+    get_rider_details,
+    get_trip_details,
+    get_trips_by_date,
+    check_payout_history,
+    check_refund_policy,
+    initiate_payout,
+    escalate_to_ops
 ]
 
 # Create the LangGraph ReAct Agent
 agent_executor = create_react_agent(
-    model=llm, 
+    model=llm,
     tools=tools
 )
 
-def process_dispute_message(rider_id: str, message: str) -> str:
+def get_recent_history(rider_id: str, limit: int = 4) -> list:
+    """Fetches recent conversation turns from the database for multi-turn context without duplication."""
+    db = SessionLocal()
+    history = []
+    try:
+        msgs = db.query(ConversationMessage).filter(
+            ConversationMessage.rider_id == rider_id,
+            ConversationMessage.sender == "rider"
+        ).order_by(ConversationMessage.id.desc()).limit(limit).all()
+        
+        # Order chronologically
+        msgs.reverse()
+        for m in msgs:
+            history.append(("human", m.text))
+            if m.reply_text:
+                history.append(("ai", m.reply_text))
+    except Exception as e:
+        logger.warning(f"Could not load conversation history for {rider_id}: {e}")
+    finally:
+        db.close()
+    return history
+
+def process_dispute_message(rider_id: str, message: str, message_id: str = None, received_at: str = None) -> str:
     """
-    Takes a rider's message, runs it through the LangGraph agent,
-    and returns the final AI response strictly grounded in data.
+    Takes a rider's message, incorporates multi-turn memory, runs it through the
+    LangGraph ReAct agent, records audit trace steps, and returns the AI reply.
     """
-    # Inject the SYSTEM_PROMPT directly as the first message to ensure framework compatibility
-    inputs = {
-        "messages": [
-            ("system", SYSTEM_PROMPT),
-            ("human", f"[Rider ID: {rider_id}] {message}")
-        ]
-    }
+    # 1. Record incoming message in trace audit log
+    record_trace(
+        rider_id=rider_id,
+        step_type="message_in",
+        name="incoming_message",
+        input_data={"message_id": message_id, "text": message, "received_at": received_at},
+        output_data=None
+    )
+
+    # 2. Build conversational message sequence with history
+    messages = [("system", SYSTEM_PROMPT)]
+    past_turns = get_recent_history(rider_id)
+    messages.extend(past_turns)
     
-    # Run the agent reasoning and tool execution loop
-    result = agent_executor.invoke(inputs)
+    # Append current message with explicit rider identity grounding
+    messages.append(("human", f"[Rider ID: {rider_id}] {message}"))
     
-    # Return the content of the last AI message
-    return result["messages"][-1].content
+    inputs = {"messages": messages}
+
+    try:
+        # 3. Execute agent loop
+        result = agent_executor.invoke(inputs)
+        reply_content = result["messages"][-1].content
+    except Exception as e:
+        logger.error(f"Error during agent execution: {e}", exc_info=True)
+        record_trace(
+            rider_id=rider_id,
+            step_type="error",
+            name="agent_execution_failure",
+            input_data={"message": message},
+            output_data=str(e)
+        )
+        print(f"ACTUAL CRASH REASON: {str(e)}")
+        reply_content = "Bhai, humare system mein thodi takneeki samasya aayi hai. Kripya thodi der baad dobara message karein."
+
+    # 4. Record agent reply in trace log
+    record_trace(
+        rider_id=rider_id,
+        step_type="reply",
+        name="agent_reply",
+        input_data=None,
+        output_data=reply_content
+    )
+
+    return reply_content

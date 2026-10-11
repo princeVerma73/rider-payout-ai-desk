@@ -1,5 +1,5 @@
 services:
-  postgres:
+  db:
     image: postgres:15
     environment:
       POSTGRES_DB: quickdrop
@@ -7,25 +7,41 @@ services:
       POSTGRES_PASSWORD: password
     ports:
       - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U user -d quickdrop"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      default:
+        aliases:
+          - postgres
+          - db
 
   payswift:
     build: ./payswift
     ports:
       - "8081:8081"
 
-  app:
+  web:
     build: .
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
+      db:
         condition: service_healthy
+      payswift:
+        condition: service_started
+    volumes:
+      - ./app:/app/app
+      - ./ops-ui:/app/ops-ui
     environment:
-      - DATABASE_URL=postgresql://user:password@postgres:5432/quickdrop
+      - DATABASE_URL=postgresql://user:password@db:5432/quickdrop
       - PAYSWIFT_BASE_URL=http://payswift:8081
       - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-qwen/qwen3.8-27b}
+
+volumes:
+  postgres_data:

@@ -29,21 +29,34 @@ class PayoutLine(Base):
 class ConversationMessage(Base):
     __tablename__ = "conversation_messages"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    message_id = Column(String, unique=True)
-    rider_id = Column(String)
+    message_id = Column(String, unique=True, index=True)
+    rider_id = Column(String, index=True)
     sender = Column(String)  # 'rider' or 'agent'
     text = Column(Text)
     created_at = Column(String)
+    reply_text = Column(Text, nullable=True)  # cached reply for idempotency / dedup
 
 class OpsDispute(Base):
     __tablename__ = "ops_disputes"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    rider_id = Column(String)
+    dispute_id = Column(String, unique=True, index=True)  # e.g., 'op-001'
+    rider_id = Column(String, index=True)
     trip_id = Column(String, nullable=True)
-    amount = Column(Float)
+    type = Column(String, default="approval")  # 'approval' or 'escalation'
+    amount = Column(Float, nullable=True)  # in rupees, null for escalations
     reason = Column(Text)
-    status = Column(String, default="PENDING")
+    status = Column(String, default="PENDING")  # 'PENDING', 'APPROVED', 'REJECTED'
     created_at = Column(String)
+
+class TraceStep(Base):
+    __tablename__ = "trace_steps"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rider_id = Column(String, index=True)
+    at = Column(String)  # ISO timestamp
+    type = Column(String)  # 'message_in', 'tool_call', 'decision', 'reply', 'error'
+    name = Column(String)
+    input = Column(Text, nullable=True)  # JSON-encoded input or null
+    output = Column(Text, nullable=True)  # JSON-encoded output or string
 
 def init_db():
     Base.metadata.create_all(bind=engine)
