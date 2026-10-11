@@ -10,10 +10,10 @@ from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.tools import get_rider_details, get_trip_details, check_payout_history
 from app.agent.policy import check_refund_policy
 
-# Initialize Groq LLM with the latest supported stable model
+# Initialize Groq LLM with an active and accessible model
 llm = ChatGroq(
     api_key=os.environ.get("GROQ_API_KEY"),
-    model_name="llama-3.1-70b-versatile",  # Fixed: Replaced decommissioned model
+    model_name=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
     temperature=0
 )
 
