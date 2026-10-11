@@ -4,17 +4,17 @@ from app.db.session import SessionLocal
 from app.db.models import init_db, Rider, Trip, PayoutLine
 
 def seed_database():
-    # Pehle tables create karo agar nahi bani hain toh
+    # Initialize database tables if they do not exist
     init_db()
     db = SessionLocal()
 
-    # Agar data pehle se hai, toh wapas seed mat karo
+    # Skip seeding if data is already present
     if db.query(Rider).first():
         print("Database already seeded. Skipping.")
         db.close()
         return
 
-    # Data folder ka sahi path dhoondhna
+    # Locate data directory path
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     data_dir = os.path.join(base_dir, "data")
 
@@ -73,7 +73,7 @@ def seed_database():
                 date=date_val
             ))
 
-    # Saara data save (commit) karo aur connection close karo
+    # Commit all seeded records and close session
     db.commit()
     db.close()
     print("Database seeding completed successfully.")

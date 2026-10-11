@@ -3,11 +3,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 
-# Docker container ke andar postgres se connect karne ke liye URL
+# PostgreSQL connection URL
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost:5432/quickdrop")
 
-# Fallback: Agar URL me 'db' ya 'postgres' hostname hai lekin hum host machine pe local uvicorn chala rahe hain,
-# toh 'db'/'postgres' resolve nahi hoga. Aise case me transparently 'localhost' par switch karo.
+# Fallback: If URL uses 'db'/'postgres' host but running locally without docker network DNS,
+# gracefully fallback to localhost.
 import socket
 for host in ["db", "postgres"]:
     if f"@{host}:" in DATABASE_URL:
