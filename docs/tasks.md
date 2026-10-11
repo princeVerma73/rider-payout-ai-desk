@@ -46,15 +46,15 @@ gantt
 
 ## Phase 1 — Setup & Infrastructure
 
-- [ ] Create private GitHub repo `rider-payout-ai-desk`
+- [x] Create private GitHub repo `rider-payout-ai-desk`
 - [ ] Add `pratham-saraf` as collaborator
-- [ ] Copy `docker-compose.yml` starter — keep `payswift` service intact
-- [ ] Add `postgres` service to `docker-compose.yml`
-- [ ] Create `.env.example` with all variables
-- [ ] Create `Dockerfile` for your app
-- [ ] Add `GET /health` returning `200 OK`
-- [ ] Write DB migration (create all tables)
-- [ ] Write CSV seeder (`data/riders.csv`, `trips.csv`, `payout_lines.csv` → DB)
+- [x] Copy `docker-compose.yml` starter — keep `payswift` service intact
+- [x] Add `postgres` service to `docker-compose.yml`
+- [x] Create `.env.example` with all variables
+- [x] Create `Dockerfile` for your app
+- [x] Add `GET /health` returning `200 OK`
+- [x] Write DB migration (create all tables)
+- [x] Write CSV seeder (`data/riders.csv`, `trips.csv`, `payout_lines.csv` → DB)
 - [ ] Verify: `docker compose up` starts and `/health` returns 200
 
 **Quickest way to verify Phase 1:**
@@ -98,7 +98,7 @@ curl http://localhost:8000/health
 
 ### 2c. LLM + Tool Calling
 
-- [ ] Set up Groq SDK (or Gemini):
+- [~] Set up Groq SDK (or Gemini):
   ```python
   # Groq
   from groq import Groq

@@ -662,3 +662,1091 @@ services:
 | `app/main.py` | FastAPI entrypoint & route stubs | Startup hook for seeding, Pydantic validation, placeholder stubs for future agent logic |
 | `Dockerfile` | App container build recipe | Layer-caching via split COPY, `0.0.0.0` bind, `slim` base image |
 | `docker-compose.yml` | Multi-service orchestration | `service_healthy` condition for safe startup ordering, Docker DNS for inter-service calls |
+
+---
+
+## Dry Run 2 - LangChain Base Setup & Docker Rebuild
+
+### Changes Made in This Step
+
+| Change | Details |
+|---|---|
+| `requirements.txt` | Added `langchain`, `langchain-groq`, and `langgraph` as new dependencies |
+| `.env` / `.env.example` | `GROQ_API_KEY` configured in `.env` (local) — already templated in `.env.example` as `LLM_API_KEY` |
+| `app/agent/prompts.py` | **New file** — holds the agent system prompt constant |
+| `app/agent/core.py` | **New file** — initializes the `ChatGroq` LLM instance via LangChain |
+| Docker | Successfully rebuilt with `docker compose up --build -d`; all 3 containers healthy |
+
+> **New directory created:** `app/agent/` — this sub-package will house all agent logic (prompts, tools, graph, state).
+
+---
+
+### Section 1 of 2 — `requirements.txt` & `app/agent/core.py`
+
+---
+
+#### File 1: `requirements.txt`
+
+```text
+fastapi==0.110.0
+uvicorn==0.27.1
+sqlalchemy==2.0.29
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1
+httpx==0.27.0
+pandas==2.2.1
+groq==0.4.2
+langchain
+langchain-groq
+langgraph
+```
+
+#### Dry Run & Explanation — `requirements.txt`
+
+**Purpose:** Declares all Python packages the app needs. Docker's `RUN pip install -r requirements.txt` installs these when building the image. Adding new packages here and rebuilding with `--build` ensures they land inside the container.
+
+---
+
+**Pre-existing packages (lines 1–8) — recap:**
+
+| Package | Role |
+|---|---|
+| `fastapi==0.110.0` | HTTP framework — serves all API routes |
+| `uvicorn==0.27.1` | ASGI server — runs FastAPI inside Docker |
+| `sqlalchemy==2.0.29` | ORM — maps Python classes to Postgres tables |
+| `psycopg2-binary==2.9.9` | Postgres driver — the low-level connector SQLAlchemy uses |
+| `python-dotenv==1.0.1` | Loads `.env` file into `os.environ` at startup |
+| `httpx==0.27.0` | Async HTTP client — for calling PaySwift's REST API |
+| `pandas==2.2.1` | DataFrame library — reads and processes CSV seed files |
+| `groq==0.4.2` | Groq's own Python SDK (lower-level; kept for potential direct API calls) |
+
+---
+
+**Newly added packages (lines 9–11):**
+
+```text
+langchain
+langchain-groq
+langgraph
+```
+
+**`langchain` — WHY:**
+- LangChain is the orchestration framework that wraps LLMs with a consistent interface. It provides `ChatGroq`, `HumanMessage`, `SystemMessage`, tool-calling utilities, and chain composition primitives.
+- **HOW it works:** Rather than writing raw HTTP calls to Groq's API, LangChain abstracts the request/response cycle. We call `llm.invoke([...messages...])` and get a structured `AIMessage` back, regardless of which underlying LLM provider is used. This makes swapping providers (Groq → Gemini) a one-line change.
+
+**`langchain-groq` — WHY:**
+- This is the **provider plugin** that connects LangChain's abstract `ChatGroq` class to Groq's actual API endpoint. LangChain itself is provider-agnostic — it needs a concrete integration package for each provider.
+- **HOW it works:** `from langchain_groq import ChatGroq` imports a class that knows Groq's API base URL, authentication headers, and request/response format. It handles retries, streaming, and tool-call schema translation automatically.
+
+**`langgraph` — WHY:**
+- LangGraph is a LangChain extension for building **stateful, multi-step agent graphs**. For this project, the agent needs to:
+  1. Receive a rider message
+  2. Decide which tool to call (get_trips, get_payout_lines, initiate_payment, escalate_to_ops)
+  3. Execute the tool
+  4. Decide whether to call another tool or reply
+  5. Loop until a final answer is ready
+- A simple single-shot LLM call cannot handle this loop. LangGraph models it as a directed graph of nodes (LLM call, tool execution, router) connected by conditional edges — exactly the agentic loop we need.
+
+**WHY no pinned versions for the new packages:**
+- `langchain`, `langchain-groq`, and `langgraph` are fast-moving packages. Pinning to a specific version risks breaking when their inter-package compatibility requires simultaneous upgrades. Leaving them unpinned lets pip resolve a compatible set at build time. Once stabilized, these should be pinned for production reproducibility.
+
+**HOW Docker picks this up:**
+```
+Docker build sequence (triggered by --build):
+  1. Dockerfile: COPY requirements.txt .
+  2. Dockerfile: RUN pip install --no-cache-dir -r requirements.txt
+       -> pip installs ALL 11 packages including langchain, langchain-groq, langgraph
+  3. Dockerfile: COPY . .         [app source code including app/agent/ copied in]
+  4. CMD: uvicorn app.main:app    [server starts with new packages available]
+```
+The `--build` flag in `docker compose up --build -d` forces Docker to re-execute the pip install layer even if the image already exists — ensuring the new packages are present in the running container.
+
+---
+
+#### File 2: `app/agent/core.py`
+
+```python
+import os
+from langchain_groq import ChatGroq
+
+# Initialize Groq LLM with Llama-3
+llm = ChatGroq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+    model_name="llama3-70b-8192",
+    temperature=0
+)
+```
+
+#### Dry Run & Explanation — `app/agent/core.py`
+
+**Purpose:** This is the **single point of LLM initialization** for the entire application. Every part of the agent stack (tool-calling loop, graph nodes, tests) imports `llm` from here — exactly the same pattern used for `engine` and `SessionLocal` in `session.py`.
+
+---
+
+**Line-by-Line Walkthrough:**
+
+```python
+import os
+```
+- `os` is needed to read environment variables. The API key must never be hardcoded in source — it is read at runtime from the container's environment.
+
+```python
+from langchain_groq import ChatGroq
+```
+- **HOW:** Imports the `ChatGroq` class from the `langchain-groq` package. `ChatGroq` is a LangChain `BaseChatModel` — it implements the standard LangChain chat interface (`invoke`, `stream`, `bind_tools`, etc.) while routing calls to Groq's API under the hood.
+- **WHY `langchain_groq` over raw `groq`:** The raw `groq` SDK returns plain Python dicts. `ChatGroq` returns structured `AIMessage` objects with `.content`, `.tool_calls`, and `.response_metadata` attributes — making downstream processing in LangGraph nodes cleaner and less error-prone.
+
+```python
+llm = ChatGroq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+    model_name="llama3-70b-8192",
+    temperature=0
+)
+```
+
+**`api_key=os.environ.get("GROQ_API_KEY")`**
+- **HOW:** Reads the `GROQ_API_KEY` value from the container's environment. In Docker, this is passed via `docker-compose.yml`:
+  ```yaml
+  environment:
+    - GROQ_API_KEY=${GROQ_API_KEY}
+  ```
+  Docker Compose substitutes `${GROQ_API_KEY}` from the host machine's `.env` file.
+- **WHY `os.environ.get()` not `os.environ[]`:** `.get()` returns `None` if the key is missing instead of raising a `KeyError`. This allows the module to import cleanly even in environments where the key hasn't been set yet — the error surfaces only when the LLM is actually called, giving a clearer traceback.
+
+**`model_name="llama3-70b-8192"`**
+- **HOW:** Tells the Groq API which model to run. Groq hosts inference for open-source models on their custom LPU hardware.
+- **WHY Llama-3 70B:**
+  - **Capability:** 70B parameters give strong reasoning for multi-turn conversations, tool selection, and financial dispute logic (understanding "surge nahi mila" in Hinglish, selecting the right tool, producing a coherent reply).
+  - **Context window:** 8192 tokens — sufficient for a conversation history + trip data + payout lines passed as context.
+  - **Speed:** Groq's LPU delivers Llama-3 70B at hundreds of tokens/second — fast enough for near-real-time rider replies without the 10-second vendor timeout risk.
+  - **Cost:** Groq's free tier is sufficient for development and testing (as explicitly allowed in the BRIEF).
+
+**`temperature=0`**
+- **HOW:** Controls randomness in token sampling. `0` means the model always picks the highest-probability next token (greedy decoding).
+- **WHY `0` for this use case:**
+  - Payout dispute resolution is a **deterministic, rule-based domain**. Given the same rider complaint and the same trip data, the agent should always reach the same conclusion and make the same payment decision.
+  - Non-zero temperature introduces randomness — the agent might pay on one run and refuse on another for the same dispute. In a financial system, this is unacceptable.
+  - `temperature=0` makes the agent **auditable and reproducible** — ops can replay a dispute and get the same reasoning trace.
+
+---
+
+**Data Flow — How `llm` travels through the system:**
+
+```
+.env (GROQ_API_KEY=gsk_...)
+    |
+    v
+docker-compose.yml (environment: - GROQ_API_KEY=${GROQ_API_KEY})
+    |
+    v [injected into container at runtime]
+    |
+app/agent/core.py
+    llm = ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), ...)
+    |
+    v [imported by future modules]
+    |
+app/agent/graph.py  (future)          app/agent/tools.py  (future)
+    llm.bind_tools([...tools...])         called when LLM picks a tool
+    llm.invoke([SystemMessage, ...])
+    |
+    v [AIMessage with .content or .tool_calls]
+    |
+app/main.py POST /messages
+    return {"reply": agent_response}
+    |
+    v [JSON response back to WhatsApp vendor]
+    |
+Rider's phone
+```
+
+---
+
+### Section 2 of 2 — `app/agent/prompts.py` (bonus file)
+
+> **Note:** The user instruction specified 2 files per section. `prompts.py` is documented here as a short addendum since it was created in the same step and directly feeds into `core.py`'s usage.
+
+---
+
+#### File: `app/agent/prompts.py`
+
+```python
+SYSTEM_PROMPT = """You are an AI Support Agent for the QuickDrop Rider Payout Dispute Desk.
+Your job is to help riders with their payout and trip-related queries.
+Be professional, concise, and helpful. Always investigate before making a decision."""
+```
+
+#### Dry Run & Explanation — `prompts.py`
+
+**Purpose:** Centralizes the agent's identity and behavioral instructions in one importable constant. Every LLM call will inject this as the `SystemMessage` — it defines WHO the agent is and HOW it should behave before any rider message is processed.
+
+---
+
+**Line-by-Line:**
+
+```python
+SYSTEM_PROMPT = """..."""
+```
+- A module-level string constant (no class, no function). Any file can do `from app.agent.prompts import SYSTEM_PROMPT` and use it directly.
+- **WHY a separate file, not hardcoded in `core.py`:** The system prompt will evolve independently of the LLM initialization config. Separating them means prompt engineers can iterate on the text without touching LLM parameters, and vice versa.
+
+**`"You are an AI Support Agent for the QuickDrop Rider Payout Dispute Desk."`**
+- **WHY this matters:** LLMs use the system prompt to establish role and context. Without a clear role definition, the model defaults to generic assistant behavior — it might refuse to discuss payment details, or give overly verbose explanations inappropriate for a WhatsApp chat.
+
+**`"Your job is to help riders with their payout and trip-related queries."`**
+- **HOW it scopes behavior:** Explicitly narrows the domain. If a rider asks something off-topic ("what's the weather?"), the grounded system prompt helps the model redirect politely rather than answering.
+
+**`"Be professional, concise, and helpful."`**
+- **WHY concise:** Rider replies go back via WhatsApp. Long walls of text are bad UX on mobile. The LLM needs explicit instruction to be brief.
+
+**`"Always investigate before making a decision."`**
+- **WHY this is the most important line:** This is the guard against hallucinated payouts. Without it, an aggressive model might decide "the rider is right" based solely on their complaint text, bypassing the tool calls that check actual trip and payout data. This instruction enforces the intended flow:
+  ```
+  Rider complaint -> Agent calls get_trips() -> Agent calls get_payout_lines()
+      -> Agent computes discrepancy -> THEN decides to pay or explain
+  ```
+- **HOW the LLM uses it:** When the system prompt says "always investigate first," Llama-3 learns from its training that "investigate" in an agentic context means "call the available tools to gather data." This is a soft behavioral nudge — it will be reinforced by the tool definitions added in the next step.
+
+---
+
+### Summary Table — All Changes in Dry Run 2
+
+| File | Status | Role | Key Decision |
+|---|---|---|---|
+| `requirements.txt` | Updated | Dependency manifest | Added `langchain`, `langchain-groq`, `langgraph` — the full LangChain + graph agent stack |
+| `app/agent/core.py` | New | LLM singleton | `ChatGroq` with Llama-3 70B, `temperature=0` for deterministic financial decisions |
+| `app/agent/prompts.py` | New | System prompt constant | Scopes agent identity, enforces "investigate first" before any payout decision |
+| Docker rebuild | Done | Runtime | `docker compose up --build -d` — all 3 containers healthy with new packages installed |
+
+---
+
+## Dry Run 3 (Step 2) - AI Database Tools (tools.py)
+
+### New File Created
+
+| File | Status | Location |
+|---|---|---|
+| `app/agent/tools.py` | **New** | `app/agent/tools.py` |
+
+This file introduces **3 LangChain-compatible database tools** that give the AI agent the ability to query real data from Postgres. These tools are the bridge between the LLM's reasoning and the actual facts stored in our database — without them, the agent would be forced to guess or hallucinate answers.
+
+---
+
+### Complete Code — `app/agent/tools.py`
+
+```python
+from app.db.session import SessionLocal
+from app.db.models import Rider, Trip, PayoutLine
+from langchain_core.tools import tool
+
+@tool
+def get_rider_details(rider_id: str) -> str:
+    """
+    Use this tool to get the basic details (name, city, phone) of a rider by their rider_id.
+    Call this when you need to verify if a rider exists or need their contact info.
+    """
+    db = SessionLocal()
+    try:
+        rider = db.query(Rider).filter(Rider.rider_id == rider_id).first()
+        if rider:
+            return f"Rider {rider.rider_id} details: Name={rider.name}, City={rider.city}, Phone={rider.phone}"
+        return f"No rider found with ID {rider_id}"
+    except Exception as e:
+        return f"Error fetching rider: {str(e)}"
+    finally:
+        db.close()
+
+@tool
+def get_trip_details(trip_id: str) -> str:
+    """
+    Use this tool to get details of a specific trip (status, distance, fare, rider_id) by its trip_id.
+    Call this when a rider asks about a specific trip to check if it was completed, cancelled, or failed.
+    """
+    db = SessionLocal()
+    try:
+        trip = db.query(Trip).filter(Trip.trip_id == trip_id).first()
+        if trip:
+            return (f"Trip {trip.trip_id} details: Rider={trip.rider_id}, "
+                    f"Distance={trip.distance_km}km, Fare={trip.fare}, Status={trip.status}")
+        return f"No trip found with ID {trip_id}"
+    except Exception as e:
+        return f"Error fetching trip: {str(e)}"
+    finally:
+        db.close()
+
+@tool
+def check_payout_history(rider_id: str) -> str:
+    """
+    Use this tool to check all previous payout lines (refunds, penalties, earnings) for a specific rider.
+    Call this to verify if a refund for a specific trip has already been processed before.
+    """
+    db = SessionLocal()
+    try:
+        payouts = db.query(PayoutLine).filter(PayoutLine.rider_id == rider_id).all()
+        if not payouts:
+            return f"No payout history found for Rider {rider_id}."
+
+        history = []
+        for p in payouts:
+            history.append(f"[LineID: {p.line_id}, Trip: {p.trip_id}, Amount: {p.amount}, Category: {p.category}]")
+
+        return "Payout History:\n" + "\n".join(history)
+    except Exception as e:
+        return f"Error fetching payouts: {str(e)}"
+    finally:
+        db.close()
+```
+
+---
+
+### Dry Run & Explanation — `app/agent/tools.py`
+
+---
+
+#### KYON (Why) — Why Do We Need These Tools At All?
+
+Before answering the "what" and "how", it is important to understand the fundamental problem these tools solve.
+
+**The AI Hallucination Problem:**
+
+A raw LLM (even Llama-3 70B) has no access to QuickDrop's database. If a rider says:
+> *"Bhai order T88213 ka surge nahi mila"*
+
+...the model has two choices without tools:
+1. **Hallucinate** — make up a plausible-sounding answer ("Yes, I can see your trip had a surge of ₹45...") which may be completely wrong.
+2. **Refuse** — say "I don't have access to your trip data" — useless for dispute resolution.
+
+**The solution — Tool Calling:** We give the LLM a set of functions it *can call* when it needs real data. The LLM does not execute them directly — it signals "I want to call `get_trip_details` with `trip_id='T88213'`", the framework executes the actual DB query, and the result is fed back to the LLM as a follow-up message. The LLM then reasons on **real facts**, not invented ones.
+
+**Why 3 separate tools instead of 1 big query?**
+- **Principle of least privilege:** The LLM only fetches what it needs. If the rider asks about a trip, calling `get_trip_details` is sufficient — no need to dump the entire payout history into the context window.
+- **Token efficiency:** Each tool returns a compact, targeted string. Fetching everything at once would waste context tokens and increase latency.
+- **Composability:** The LLM can chain tools in sequence: first verify the rider exists → then get the trip → then check payouts. This mirrors how a human ops executive investigates a complaint step by step.
+
+---
+
+#### KAISE (How) — The `@tool` Decorator and LangChain Tool Calling
+
+```python
+from langchain_core.tools import tool
+```
+
+**HOW `@tool` works — the decorator deep dive:**
+
+The `@tool` decorator from `langchain_core` is not just syntactic sugar. When applied to a function, it does three critical things:
+
+1. **Creates a `StructuredTool` object** — wraps the plain Python function in a LangChain-compatible class that has `.name`, `.description`, `.args_schema`, and `.run()` attributes.
+
+2. **Extracts the JSON Schema from type hints** — reads the function signature (`rider_id: str`) and auto-generates an OpenAI/Groq-compatible JSON schema:
+   ```json
+   {
+     "name": "get_rider_details",
+     "description": "Use this tool to get the basic details...",
+     "parameters": {
+       "type": "object",
+       "properties": {
+         "rider_id": { "type": "string" }
+       },
+       "required": ["rider_id"]
+     }
+   }
+   ```
+   This schema is sent to the LLM as part of the `bind_tools()` call. The LLM uses it to know *which tools are available* and *what arguments each tool expects*.
+
+3. **Uses the docstring as the tool's description** — the text inside `"""..."""` is *literally what the LLM reads* to decide whether to call this tool. It is not a comment for developers — it is an **instruction to the AI**.
+
+**WHY the docstring wording matters so much:**
+
+```python
+"""
+Use this tool to get the basic details (name, city, phone) of a rider by their rider_id.
+Call this when you need to verify if a rider exists or need their contact info.
+"""
+```
+
+- The phrase **"Call this when..."** gives the LLM an explicit trigger condition. Without this, the model has to guess when each tool is appropriate.
+- Listing the exact fields returned (`name, city, phone`) tells the LLM what information it will get — so it knows whether this tool answers the question at hand.
+- Bad docstrings lead to wrong tool selection. If the docstring just said `"""Get rider info."""`, the LLM might call this tool for payout questions (because "rider info" is vague).
+
+**The full tool-calling data flow:**
+```
+1. llm.bind_tools([get_rider_details, get_trip_details, check_payout_history])
+       |
+       v  [LLM receives the JSON schemas of all 3 tools]
+       |
+2. rider message: "T88213 ka surge nahi mila"
+       |
+       v  [LLM reasons: I need trip info -> pick get_trip_details]
+       |
+3. LLM returns AIMessage with tool_calls:
+       [{"name": "get_trip_details", "args": {"trip_id": "T88213"}}]
+       |
+       v  [LangGraph tool node executes the actual Python function]
+       |
+4. get_trip_details("T88213") -> queries Postgres -> returns string result
+       |
+       v  [result added as ToolMessage in conversation history]
+       |
+5. LLM receives the real data -> reasons -> may call another tool or reply
+       |
+       v  [final AIMessage with .content = rider reply]
+```
+
+---
+
+#### KYA (What) — Function-by-Function Breakdown
+
+---
+
+**Tool 1: `get_rider_details(rider_id: str) -> str`**
+
+```python
+@tool
+def get_rider_details(rider_id: str) -> str:
+    """
+    Use this tool to get the basic details (name, city, phone) of a rider by their rider_id.
+    Call this when you need to verify if a rider exists or need their contact info.
+    """
+    db = SessionLocal()
+    try:
+        rider = db.query(Rider).filter(Rider.rider_id == rider_id).first()
+        if rider:
+            return f"Rider {rider.rider_id} details: Name={rider.name}, City={rider.city}, Phone={rider.phone}"
+        return f"No rider found with ID {rider_id}"
+    except Exception as e:
+        return f"Error fetching rider: {str(e)}"
+    finally:
+        db.close()
+```
+
+**KYA (What it does):**
+Looks up a single rider in the `riders` table by their `rider_id` and returns their name, city, and phone as a formatted string.
+
+**KYON (Why it's needed):**
+- The messaging vendor sends `rider_id` (derived from the phone number) with every message. Before investigating any dispute, the agent should verify this rider actually exists in the system.
+- Prevents spoofing: if someone sends a fake `rider_id`, this tool returns `"No rider found"` — the agent knows not to fetch data for a non-existent rider.
+- Provides the rider's name so the agent can personalize its reply ("Hi Ravi, I checked your account...") rather than sounding robotic.
+
+**KAISE (How it works — line by line):**
+
+```python
+db = SessionLocal()
+```
+- Opens a fresh database session. `SessionLocal` was defined in `session.py` — this is a direct import from our DB layer, keeping the tool independent of FastAPI's dependency injection system.
+- **WHY a fresh session per call:** Tools can be called in any order during the agent loop. Each tool call is a discrete, short operation. Using a fresh session per tool ensures no dirty state leaks between tool calls.
+
+```python
+try:
+    rider = db.query(Rider).filter(Rider.rider_id == rider_id).first()
+```
+- **HOW:** SQLAlchemy generates `SELECT * FROM riders WHERE rider_id = '<rider_id>' LIMIT 1`.
+- `.first()` returns the first matching `Rider` object, or `None` if no match.
+- **WHY `.first()` not `.all()`:** `rider_id` is the primary key — there can only be one matching row. `.first()` is faster (stops after the first result) and semantically correct.
+
+```python
+    if rider:
+        return f"Rider {rider.rider_id} details: Name={rider.name}, City={rider.city}, Phone={rider.phone}"
+    return f"No rider found with ID {rider_id}"
+```
+- **WHY return a string (not a dict or object):** LangChain tool results are always injected back into the LLM as plain text in a `ToolMessage`. The LLM reads strings, not Python objects. A formatted string like `"Name=Ravi, City=Delhi"` is directly understandable by the model.
+- **WHY two explicit return paths:** The LLM must be able to handle both cases — a found rider and a missing one. Returning a clear "not found" string tells the LLM to stop and inform the rider, rather than continuing with null data.
+
+```python
+except Exception as e:
+    return f"Error fetching rider: {str(e)}"
+finally:
+    db.close()
+```
+- **WHY `except` returns a string instead of re-raising:** If the tool raises an exception, LangGraph's tool node would propagate it up and crash the agent loop. By catching it and returning an error string, the LLM receives a message like "Error fetching rider: connection refused" and can decide to escalate to ops or ask the rider to try again — graceful degradation.
+- **WHY `finally: db.close()`:** The `finally` block runs whether the query succeeded, returned nothing, or raised an exception. This guarantees the DB connection is always returned to the pool — no connection leaks even under failure.
+
+---
+
+**Tool 2: `get_trip_details(trip_id: str) -> str`**
+
+```python
+@tool
+def get_trip_details(trip_id: str) -> str:
+    """
+    Use this tool to get details of a specific trip (status, distance, fare, rider_id) by its trip_id.
+    Call this when a rider asks about a specific trip to check if it was completed, cancelled, or failed.
+    """
+    db = SessionLocal()
+    try:
+        trip = db.query(Trip).filter(Trip.trip_id == trip_id).first()
+        if trip:
+            return (f"Trip {trip.trip_id} details: Rider={trip.rider_id}, "
+                    f"Distance={trip.distance_km}km, Fare={trip.fare}, Status={trip.status}")
+        return f"No trip found with ID {trip_id}"
+    except Exception as e:
+        return f"Error fetching trip: {str(e)}"
+    finally:
+        db.close()
+```
+
+**KYA (What it does):**
+Fetches a single trip from the `trips` table by `trip_id` and returns its rider association, distance, fare, and status.
+
+**KYON (Why it's needed):**
+- The most common rider complaint references a specific trip ID: *"T88213 ka surge nahi mila"*, *"order T926334 ka payout nahi aaya"*. The agent needs to look up the raw trip record to:
+  1. Confirm the trip belongs to the complaining rider (not someone else's trip ID).
+  2. Check the trip's `status` — a `CANCELLED` trip gets no payout, a `COMPLETED` trip should.
+  3. Get the `fare` and `distance_km` to calculate what the rider *should* have earned and compare it with what `check_payout_history` shows was actually paid.
+- Without this tool, the LLM cannot distinguish between a valid dispute ("the fare was underpaid") and an invalid one ("the trip was cancelled, no payout is correct").
+
+**KAISE (How it works — key points):**
+
+```python
+trip = db.query(Trip).filter(Trip.trip_id == trip_id).first()
+```
+- Generates: `SELECT * FROM trips WHERE trip_id = '<trip_id>' LIMIT 1`.
+- `trip_id` is the primary key of the `trips` table, so this is an indexed lookup — fast even with thousands of trips in the seeded data.
+
+```python
+return (f"Trip {trip.trip_id} details: Rider={trip.rider_id}, "
+        f"Distance={trip.distance_km}km, Fare={trip.fare}, Status={trip.status}")
+```
+- **WHY include `Rider={trip.rider_id}` in the output:** The LLM can cross-check that the trip's `rider_id` matches the `rider_id` of the person who sent the message — a security check against riders claiming other riders' trips. If `trip.rider_id != message.rider_id`, the agent should refuse and not process the dispute.
+- **WHY include `Status`:** The `status` field is the key discriminator. The LLM needs this to reason:
+  - `COMPLETED` → legitimate fare dispute, investigate further
+  - `CANCELLED` → no payout owed, explain politely
+  - `FAILED` → edge case, may need escalation
+
+---
+
+**Tool 3: `check_payout_history(rider_id: str) -> str`**
+
+```python
+@tool
+def check_payout_history(rider_id: str) -> str:
+    """
+    Use this tool to check all previous payout lines (refunds, penalties, earnings) for a specific rider.
+    Call this to verify if a refund for a specific trip has already been processed before.
+    """
+    db = SessionLocal()
+    try:
+        payouts = db.query(PayoutLine).filter(PayoutLine.rider_id == rider_id).all()
+        if not payouts:
+            return f"No payout history found for Rider {rider_id}."
+
+        history = []
+        for p in payouts:
+            history.append(f"[LineID: {p.line_id}, Trip: {p.trip_id}, Amount: {p.amount}, Category: {p.category}]")
+
+        return "Payout History:\n" + "\n".join(history)
+    except Exception as e:
+        return f"Error fetching payouts: {str(e)}"
+    finally:
+        db.close()
+```
+
+**KYA (What it does):**
+Fetches **all** payout lines from the `payout_lines` table for a given `rider_id` and returns them as a formatted multi-line string. Each line shows the payout line ID, linked trip, amount paid, and the category (base fare, surge, bonus, penalty, etc.).
+
+**KYON (Why it's needed):**
+- This is the **single most important tool for dispute validation**. The BRIEF says: *"Never pay more than the rider is owed, we lost money on this last quarter."*
+- The payout history answers the critical question: **what was actually paid vs what should have been paid?**
+  - If a rider claims "surge nahi mila" for trip T88213, this tool shows whether a `category='surge'` line exists for that trip.
+  - If it does exist → the rider is wrong, explain the payout.
+  - If it doesn't → the surge was indeed missing, initiate a correction.
+- **Double-payment prevention:** Before ever initiating a payment, the agent calls this tool to check if a payout for the disputed amount already exists. This is the guard described in the Finance note: *"reconcile against PaySwift, not your database"* — but this tool provides the internal pre-check.
+- The docstring specifically says *"Call this to verify if a refund for a specific trip has already been processed before"* — this explicit instruction trains the LLM to always check history before paying.
+
+**KAISE (How it works — key points):**
+
+```python
+payouts = db.query(PayoutLine).filter(PayoutLine.rider_id == rider_id).all()
+```
+- **WHY `.all()` here (unlike `.first()` in the other tools):** A rider can have hundreds of payout lines across many trips. The agent needs the full picture to reason about the dispute — `.all()` fetches every row.
+- Generates: `SELECT * FROM payout_lines WHERE rider_id = '<rider_id>'`
+
+```python
+if not payouts:
+    return f"No payout history found for Rider {rider_id}."
+```
+- **WHY handle the empty case explicitly:** If the DB has no payout lines for a rider, the LLM needs a clear signal — not an empty list or `None`. The string response keeps the agent loop running gracefully.
+
+```python
+history = []
+for p in payouts:
+    history.append(f"[LineID: {p.line_id}, Trip: {p.trip_id}, Amount: {p.amount}, Category: {p.category}]")
+
+return "Payout History:\n" + "\n".join(history)
+```
+- **HOW the output is structured:** Each payout line is formatted as a bracketed entry on its own line:
+  ```
+  Payout History:
+  [LineID: PL001, Trip: T88213, Amount: 120.0, Category: base_fare]
+  [LineID: PL002, Trip: T88213, Amount: 45.0, Category: surge]
+  [LineID: PL003, Trip: T92001, Amount: 150.0, Category: incentive]
+  ```
+- **WHY this specific format:** The LLM can scan this structured output and identify:
+  - Whether a specific `trip_id` appears in the history
+  - Whether the `Category` matches the type of dispute (e.g., missing `surge`)
+  - The `Amount` paid per category to compare against expected values
+- **WHY `\n".join(history)` instead of a single long string:** Line-by-line formatting makes it easier for the LLM to parse. A dense single-line blob of all payouts is harder to reason about than a list.
+
+---
+
+### Data Flow Summary — How Tools Connect the LLM to Postgres
+
+```
+Rider WhatsApp Message
+    "T88213 ka surge nahi mila"
+          |
+          v
+    POST /messages (app/main.py)
+          |
+          v
+    Agent loop starts (future: app/agent/graph.py)
+          |
+          v
+    LLM receives: SystemMessage + HumanMessage + tool schemas
+          |
+          v [LLM decides: need trip data first]
+          |
+    Tool call 1: get_trip_details("T88213")
+          |   -> SELECT * FROM trips WHERE trip_id = 'T88213'
+          |   <- "Trip T88213: Rider=R003, Distance=8.2km, Fare=120.0, Status=COMPLETED"
+          |
+          v [LLM sees COMPLETED trip, now checks what was paid]
+          |
+    Tool call 2: check_payout_history("R003")
+          |   -> SELECT * FROM payout_lines WHERE rider_id = 'R003'
+          |   <- "Payout History:\n[LineID: PL001, Trip: T88213, Amount: 120.0, Category: base_fare]"
+          |      (no surge line found for T88213!)
+          |
+          v [LLM reasons: surge is missing, discrepancy confirmed]
+          |
+    -> initiate_payment() OR escalate_to_ops() (future tools)
+          |
+          v
+    {"reply": "Ravi bhai, T88213 ka surge ₹25 nahi mila tha. Hum process kar rahe hain."}
+```
+
+---
+
+### Summary Table — `app/agent/tools.py`
+
+| Tool | Input | DB Table Queried | SQL Operation | Key Purpose |
+|---|---|---|---|---|
+| `get_rider_details` | `rider_id` | `riders` | `SELECT ... WHERE rider_id = ? LIMIT 1` | Verify rider exists, get identity info |
+| `get_trip_details` | `trip_id` | `trips` | `SELECT ... WHERE trip_id = ? LIMIT 1` | Check trip status, fare, ownership |
+| `check_payout_history` | `rider_id` | `payout_lines` | `SELECT ... WHERE rider_id = ?` | Verify what was actually paid, prevent double-payment |
+
+> **Common pattern across all 3 tools:** `SessionLocal()` → `try/query/return` → `except/return error string` → `finally/db.close()`. This pattern ensures every tool is safe, self-contained, and never leaks a DB connection regardless of success or failure.
+
+
+---
+
+## Dry Run 4 - Payout Policy (policy.py)
+
+### Overview & File Changes
+- **New File Created:** `app/agent/policy.py`
+- **Purpose:** Implements QuickDrop's official payout and refund business policy as a deterministic, rule-based tool (`check_refund_policy`).
+- **Role in Architecture:** Sits between database lookups and payment execution. Prevents the AI agent from guessing, hallucinating, or arbitrarily granting refunds to riders by codifying hard company rules into executable Python logic.
+
+---
+
+### File 1: `app/agent/policy.py`
+
+#### Complete Source Code
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def check_refund_policy(trip_status: str, distance_km: float, fare: float) -> str:
+    """
+    Always use this tool BEFORE approving any refund to check the company rules.
+    Pass the trip's status, distance in km, and original fare into this tool.
+    """
+    
+    # Rule 1: Agar trip successfully complete hui thi
+    if trip_status.lower() == "completed":
+        return "Policy: Trip was completed successfully. Strictly NO REFUND allowed."
+    
+    # Rule 2: Agar system error ya failed trip hai
+    if trip_status.lower() in ["failed", "cancelled"]:
+        if distance_km < 5.0:
+            return f"Policy: Short trip ({distance_km}km) issue. APPROVED for 100% refund of ₹{fare}."
+        else:
+            partial_refund = round(fare * 0.5, 2)
+            return f"Policy: Long trip issue. APPROVED for 50% partial refund of ₹{partial_refund}."
+            
+    return "Policy: Unclear scenario. Tell the rider that manual review is required."
+```
+
+---
+
+### Dry Run & Explanation — `app/agent/policy.py`
+
+---
+
+#### KYON (Why) — Why Do We Need a Coded Payout Policy Tool?
+
+The core problem this tool solves is **unconstrained AI discretion**:
+
+1. **Preventing AI Hallucination & Empathy Drift:**
+   - LLMs are inherently biased towards pleasing the user. When a distressed or angry delivery rider messages:
+     > *"Bhai mere ₹250 kaat liye, trip cancel ho gayi thi, bache bhookhe hain please refund kardo!"*
+   - Without a deterministic programmatic guardrail, an LLM might sympathize and reply: *"Don't worry, I have approved a full refund of ₹250 for you."*
+   - This creates catastrophic financial leakage for the platform. As noted in the company brief: *"Never pay more than the rider is owed, we lost money on this last quarter."*
+
+2. **Decoupling Business Rules from Prompt Instructions:**
+   - If business rules are placed only inside a prompt (`prompts.py`), LLMs can experience prompt injection, jailbreaking, or simply miscalculate math (e.g. 50% of ₹143.75).
+   - By implementing policies in **pure Python code**, calculations (`fare * 0.5`) and conditions are 100% deterministic and mathematically accurate. The LLM does not perform the refund calculation; it merely delegates the calculation to Python.
+
+3. **Separation of Policy Logic from Database Storage:**
+   - Unlike `tools.py` which queries PostgreSQL for historical facts (`Rider`, `Trip`, `PayoutLine`), `policy.py` contains **stateless business rules**.
+   - These rules do not require database queries or external API calls, making them fast, predictable, and zero-overhead to execute.
+
+---
+
+#### KAISE (How) — Implementation & LangChain Tool Integration
+
+```python
+from langchain_core.tools import tool
+```
+
+**1. The `@tool` Decorator:**
+- Decorating `check_refund_policy` transforms the function into a LangChain `StructuredTool`.
+- LangChain inspects type hints (`trip_status: str`, `distance_km: float`, `fare: float`) and generates a structured JSON Schema:
+  ```json
+  {
+    "name": "check_refund_policy",
+    "description": "Always use this tool BEFORE approving any refund to check the company rules. Pass the trip's status, distance in km, and original fare into this tool.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "trip_status": { "type": "string" },
+        "distance_km": { "type": "number" },
+        "fare": { "type": "number" }
+      },
+      "required": ["trip_status", "distance_km", "fare"]
+    }
+  }
+  ```
+- This schema informs the LLM exactly what arguments must be extracted from the trip lookup before calling policy verification.
+
+**2. Strategic Docstring Engineering:**
+```python
+"""
+Always use this tool BEFORE approving any refund to check the company rules.
+Pass the trip's status, distance in km, and original fare into this tool.
+"""
+```
+- The directive **"Always use this tool BEFORE approving any refund"** is an explicit guardrail that forces the LLM to include policy checking in its decision path before initiating any refund.
+
+**3. Deterministic Python If/Else Flow:**
+- Uses standard case-insensitive string matching (`.lower()`) to safely evaluate status values whether they arrive as `"COMPLETED"`, `"completed"`, `"Cancelled"`, etc.
+- Uses `round(fare * 0.5, 2)` for precision rounding to 2 decimal places to match currency standards.
+
+---
+
+#### KYA (What) — Line-by-Line & Rule Breakdown
+
+##### Function Signature:
+```python
+def check_refund_policy(trip_status: str, distance_km: float, fare: float) -> str:
+```
+- **Inputs:**
+  - `trip_status` (`str`): The trip lifecycle state (e.g., `"completed"`, `"cancelled"`, `"failed"`).
+  - `distance_km` (`float`): Distance of the trip in kilometers, sourced from `get_trip_details`.
+  - `fare` (`float`): The original base/estimated fare in ₹ from `get_trip_details`.
+- **Output:** A definitive policy decision string indicating approval amount, rejection reason, or manual review trigger.
+
+---
+
+##### Rule 1: Completed Trips (`trip_status == "completed"`)
+```python
+# Rule 1: Agar trip successfully complete hui thi
+if trip_status.lower() == "completed":
+    return "Policy: Trip was completed successfully. Strictly NO REFUND allowed."
+```
+- **Logic:** If a trip was successfully completed, service was rendered and delivered.
+- **Decision:** Strictly **NO REFUND**.
+- **Impact:** Prevents riders from claiming refunds on trips they already finished and were credited for.
+
+---
+
+##### Rule 2: Failed or Cancelled Trips (`trip_status in ["failed", "cancelled"]`)
+```python
+# Rule 2: Agar system error ya failed trip hai
+if trip_status.lower() in ["failed", "cancelled"]:
+    if distance_km < 5.0:
+        return f"Policy: Short trip ({distance_km}km) issue. APPROVED for 100% refund of ₹{fare}."
+    else:
+        partial_refund = round(fare * 0.5, 2)
+        return f"Policy: Long trip issue. APPROVED for 50% partial refund of ₹{partial_refund}."
+```
+- **Short Trips (< 5.0 km):**
+  - If a rider faced a failure or cancellation early in a short trip (< 5 km), the platform awards a **100% refund** of the full `fare`.
+  - *Example:* A cancelled 3.2 km trip with ₹60 fare → Returns: `"Policy: Short trip (3.2km) issue. APPROVED for 100% refund of ₹60.0."`
+- **Long Trips (≥ 5.0 km):**
+  - If the trip was longer (≥ 5 km), partial resources or distance were consumed; the policy permits a **50% partial refund** calculated as `round(fare * 0.5, 2)`.
+  - *Example:* A failed 12.5 km trip with ₹240 fare → Returns: `"Policy: Long trip issue. APPROVED for 50% partial refund of ₹120.0."`
+
+---
+
+##### Fallback / Rule 3: Unclear or Unrecognized Scenarios
+```python
+return "Policy: Unclear scenario. Tell the rider that manual review is required."
+```
+- **Logic:** Catches any ambiguous status (e.g., `"in_progress"`, `"disputed"`, `"unknown"`).
+- **Decision:** Directs the agent to inform the rider that human ops intervention is required rather than taking an unauthorized automated action.
+
+---
+
+### End-to-End Decision Flow Diagram
+
+```
+Rider Message: "Mera cancel order T55120 ka refund chahiye"
+      │
+      ▼
+1. Agent calls: get_trip_details("T55120")
+      │
+      ▼ [Returns: status="cancelled", distance_km=3.5, fare=80.0]
+      │
+2. Agent calls: check_refund_policy(trip_status="cancelled", distance_km=3.5, fare=80.0)
+      │
+      ├── Case A: status == "completed" ───────────────► "Strictly NO REFUND allowed."
+      │
+      ├── Case B: status in ["failed", "cancelled"]
+      │     ├── distance < 5.0 km ─────────────────────► "APPROVED for 100% refund of ₹80.0"
+      │     └── distance >= 5.0 km ────────────────────► "APPROVED for 50% partial refund of ₹40.0"
+      │
+      └── Case C: Any other status ────────────────────► "Manual review is required."
+```
+
+---
+
+### Policy Decision Matrix
+
+| Trip Status | Distance Condition | Refund Outcome | Formula / Value | Agent Action |
+|---|---|---|---|---|
+| `completed` | Any distance | ❌ Rejected | ₹0.00 | Politely inform rider no refund is possible |
+| `cancelled` / `failed` | `< 5.0 km` | ✅ 100% Approved | Full `fare` | Eligible for automated refund payout |
+| `cancelled` / `failed` | `≥ 5.0 km` | ⚠️ 50% Approved | `round(fare * 0.5, 2)` | Eligible for partial refund payout |
+| Other / Unknown | Any distance | 🛑 Escalation | N/A | Escalate to human ops review |
+
+
+---
+
+## Dry Run 5 - LangGraph Agent Integration (core.py)
+
+### Overview & File Changes
+- **Modified File:** `app/agent/core.py`
+- **Purpose:** Upgrades the standalone LLM initialization into a full autonomous ReAct agent loop powered by LangGraph's `create_react_agent`.
+- **Role in Architecture:** Connects the brain (`ChatGroq` with `llama3-70b-8192`), the personality/guardrails (`SYSTEM_PROMPT`), and the agent's hands/senses (the 4 tools: `get_rider_details`, `get_trip_details`, `check_payout_history`, `check_refund_policy`). Exposes the high-level `process_dispute_message` entry point for FastAPI endpoints.
+
+---
+
+### File 1: `app/agent/core.py`
+
+#### Complete Source Code
+
+```python
+import os
+from langchain_groq import ChatGroq
+from langgraph.prebuilt import create_react_agent
+from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.tools import get_rider_details, get_trip_details, check_payout_history
+from app.agent.policy import check_refund_policy
+
+# Initialize Groq LLM
+llm = ChatGroq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+    model_name="llama3-70b-8192", 
+    temperature=0
+)
+
+# List of all tools our agent can use
+tools = [
+    get_rider_details, 
+    get_trip_details, 
+    check_payout_history, 
+    check_refund_policy
+]
+
+# Create the LangGraph ReAct Agent (Reasoning + Acting Loop)
+agent_executor = create_react_agent(
+    model=llm, 
+    tools=tools, 
+    state_modifier=SYSTEM_PROMPT
+)
+
+def process_dispute_message(rider_id: str, message: str) -> str:
+    """
+    Takes a rider's message, runs it through the LangGraph agent,
+    and returns the final AI response.
+    """
+    # Create the input format LangGraph expects
+    inputs = {"messages": [("human", f"[Rider ID: {rider_id}] {message}")]}
+    
+    # Run the agent loop (this is where the AI thinks and uses tools)
+    result = agent_executor.invoke(inputs)
+    
+    # The result contains the whole chat history, we return the last AI message
+    return result["messages"][-1].content
+```
+
+---
+
+### Dry Run & Explanation — `app/agent/core.py`
+
+---
+
+#### KYA (What) — What Was Changed and Implemented?
+
+In **Dry Run 2**, `core.py` was merely an LLM instantiation wrapper (`llm = ChatGroq(...)`). In this step:
+1. **Replaced Basic LLM Invocation with LangGraph ReAct Agent:** Upgraded from a simple, single-turn LLM instance to LangGraph's prebuilt **ReAct (Reasoning + Acting)** execution graph via `create_react_agent`.
+2. **Aggregated Full Tool Suite:** Bound 4 purpose-built tools:
+   - Database Tools: `get_rider_details`, `get_trip_details`, `check_payout_history`
+   - Business Policy Tool: `check_refund_policy`
+3. **Injected System Persona & Governance:** Injected `SYSTEM_PROMPT` as the agent's `state_modifier` so every turn is governed by QuickDrop rules and Hinglish tone.
+4. **Created Entrypoint Function (`process_dispute_message`):** A clean interface accepting `rider_id` and raw message text, invoking the compiled agent graph, and returning the extracted reply string.
+
+---
+
+#### KYON (Why) — Why Do We Need the LangGraph ReAct Loop?
+
+A raw LLM or a simple prompt template cannot solve multi-step operational disputes:
+
+1. **Autonomous Multi-Step Reasoning (ReAct Paradigm):**
+   - A rider dispute is rarely solvable in a single pass. A realistic dispute requires:
+     1. *Look up rider identity* → 
+     2. *Look up trip details* → 
+     3. *Inspect payout records for missing line items* → 
+     4. *Evaluate against refund policy* → 
+     5. *Synthesize rider response.*
+   - Without an agentic loop, developers would have to hand-code brittle state machines for every possible conversational branch. The **ReAct loop** lets the LLM dynamically decide *what tool to call next based on the output of the previous tool*.
+
+2. **Self-Correction & Information Discovery:**
+   - If `get_trip_details` returns `"No trip found"`, the agent in a ReAct loop reads that output, recognizes the missing information, and asks the rider for clarification instead of crashing or hallucinating.
+   - If a trip was completed, the agent sees `check_refund_policy` returned `"Strictly NO REFUND allowed"`, preventing it from authorizing payouts.
+
+3. **Separation of Concerns:**
+   - The route handler in `app/main.py` does not need to know about LLM mechanics, schemas, or tool node executions. It simply calls `process_dispute_message(rider_id, text)` and receives the final customer-facing response.
+
+---
+
+#### KAISE (How) — Line-by-Line Breakdown & Mechanics
+
+##### 1. Tool Bundle & Assembly:
+```python
+tools = [
+    get_rider_details, 
+    get_trip_details, 
+    check_payout_history, 
+    check_refund_policy
+]
+```
+- Bundles all domain tools into a single list.
+- Under the hood, `create_react_agent` inspects these functions, reads their docstrings and parameter schemas, and registers them as tools bound to the model.
+
+##### 2. Agent Graph Compilation:
+```python
+agent_executor = create_react_agent(
+    model=llm, 
+    tools=tools, 
+    state_modifier=SYSTEM_PROMPT
+)
+```
+- **`model=llm`:** Powers the agent with Groq's low-latency Llama-3 70B (`temperature=0` for strict deterministic logic).
+- **`tools=tools`:** Automatically sets up a tool execution node within the LangGraph state graph.
+- **`state_modifier=SYSTEM_PROMPT`:** Prepends our system prompt as a system message to the message state before every LLM deliberation, ensuring persistent system instructions across tool cycles.
+
+##### 3. Dynamic Request Handler:
+```python
+def process_dispute_message(rider_id: str, message: str) -> str:
+```
+- **Context Injection:**
+  ```python
+  inputs = {"messages": [("human", f"[Rider ID: {rider_id}] {message}")]}
+  ```
+  - Formats the input as a LangChain message tuple `("human", content)`.
+  - Prefixes `[Rider ID: {rider_id}]` to the user's message. This guarantees the LLM knows the sender's identity immediately, allowing it to call `get_rider_details(rider_id)` without asking the rider "What is your ID?".
+- **Execution Loop:**
+  ```python
+  result = agent_executor.invoke(inputs)
+  ```
+  - Executes the compiled LangGraph workflow synchronously. The agent iterates through nodes (LLM → Tools → LLM) until the model decides no further tools are needed.
+- **Extracting Response:**
+  ```python
+  return result["messages"][-1].content
+  ```
+  - The state contains the full trajectory: `[HumanMessage, AIMessage(tool_call), ToolMessage(result), AIMessage(final_reply)]`.
+  - Returning `result["messages"][-1].content` delivers the final customer-facing text string directly.
+
+---
+
+### Step-by-Step Data Flow Diagram (The ReAct Loop)
+
+```
+Incoming Rider Dispute: rider_id="R003", message="Order T88213 ka surge nahi mila"
+                           │
+                           ▼
+              process_dispute_message()
+                           │
+                           ▼
+          inputs = [HumanMessage: "[Rider ID: R003] Order T88213 ka surge nahi mila"]
+                           │
+                           ▼
+             ┌───────────────────────────┐
+             │   LangGraph Agent Loop    │
+             └─────────────┬─────────────┘
+                           │
+           ┌───────────────▼───────────────┐
+    Step 1 │ LLM Deliberation              │
+           │ Decision: Need trip info      │
+           │ Action: Call get_trip_details │
+           └───────────────┬───────────────┘
+                           │ tool_call: get_trip_details("T88213")
+                           ▼
+           ┌───────────────────────────────┐
+           │ LangGraph Tool Node           │
+           │ Runs Python DB query          │
+           │ Returns: status=COMPLETED...  │
+           └───────────────┬───────────────┘
+                           │ ToolMessage appended to state
+                           ▼
+           ┌───────────────────────────────┐
+    Step 2 │ LLM Deliberation              │
+           │ Decision: Check payout history│
+           │ Action: check_payout_history  │
+           └───────────────┬───────────────┘
+                           │ tool_call: check_payout_history("R003")
+                           ▼
+           ┌───────────────────────────────┐
+           │ LangGraph Tool Node           │
+           │ Runs Python DB query          │
+           │ Returns: Base fare only...    │
+           └───────────────┬───────────────┘
+                           │ ToolMessage appended to state
+                           ▼
+           ┌───────────────────────────────┐
+    Step 3 │ LLM Deliberation              │
+           │ Decision: No surge found,     │
+           │           No refund on        │
+           │           completed trip      │
+           │ Action: Final reply synthesis │
+           └───────────────┬───────────────┘
+                           │ No tool calls generated
+                           ▼
+             result["messages"][-1].content
+                           │
+                           ▼
+Rider Response: "Ravi ji, maine check kiya. Trip T88213 successfully complete hui thi..."
+```
+
+---
+
+### Architecture Comparison: Before vs. After
+
+| Feature | Step 1 (Previous `core.py`) | Step 4 (Current `core.py`) |
+|---|---|---|
+| **Execution Model** | Single direct LLM call (`llm.invoke`) | Multi-turn LangGraph ReAct agent graph |
+| **Tool Calling** | None | 4 integrated tools (3 DB + 1 Policy) |
+| **System Governance** | Unused constant | Active via `state_modifier=SYSTEM_PROMPT` |
+| **Identity Grounding** | None | Automatic `[Rider ID: {rider_id}]` prefix |
+| **Dynamic Execution** | None | `process_dispute_message` callable from FastAPI |
